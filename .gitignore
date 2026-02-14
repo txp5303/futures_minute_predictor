@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# 虚拟环境
+.venv/
+venv/
+
+# 数据与本地库（别上传）
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# 本地配置
+.env
+*.secret*
