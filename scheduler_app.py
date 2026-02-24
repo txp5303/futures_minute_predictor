@@ -144,6 +144,16 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_table_columns(conn: sqlite3.Connection, table: str, expected_columns: Dict[str, str]):
+    """兼容已有旧表：仅补齐缺失列（使用 SQLite ALTER TABLE 可接受的 DDL）。"""
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table});")
+    existing = {r[1] for r in cur.fetchall()}
+    for col_name, ddl in expected_columns.items():
+        if col_name not in existing:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl};")
+
+
 def init_db(conn: sqlite3.Connection):
     cur = conn.cursor()
 
@@ -179,6 +189,12 @@ def init_db(conn: sqlite3.Connection):
     );
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_kline_ts ON kline_1m(ts);")
+    _ensure_table_columns(conn, "kline_1m", {
+        "created_at": "created_at TEXT",
+        "updated_at": "updated_at TEXT",
+    })
+    cur.execute("UPDATE kline_1m SET created_at=datetime('now') WHERE created_at IS NULL OR created_at='';")
+    cur.execute("UPDATE kline_1m SET updated_at=datetime('now') WHERE updated_at IS NULL OR updated_at='';")
 
     # predictions
     cur.execute("""
@@ -199,6 +215,13 @@ def init_db(conn: sqlite3.Connection):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pred_ts ON predictions_1m(ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pred_model ON predictions_1m(model);")
+    _ensure_table_columns(conn, "predictions_1m", {
+        "sma": "sma REAL",
+        "created_at": "created_at TEXT",
+        "updated_at": "updated_at TEXT",
+    })
+    cur.execute("UPDATE predictions_1m SET created_at=datetime('now') WHERE created_at IS NULL OR created_at='';")
+    cur.execute("UPDATE predictions_1m SET updated_at=datetime('now') WHERE updated_at IS NULL OR updated_at='';")
 
     # signals
     cur.execute("""
@@ -221,6 +244,14 @@ def init_db(conn: sqlite3.Connection):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_ts ON signals_1m(ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_model ON signals_1m(model);")
+    _ensure_table_columns(conn, "signals_1m", {
+        "horizon": "horizon INTEGER NOT NULL DEFAULT 1",
+        "created_at": "created_at TEXT",
+        "updated_at": "updated_at TEXT",
+    })
+    cur.execute("UPDATE signals_1m SET created_at=datetime('now') WHERE created_at IS NULL OR created_at='';")
+    cur.execute("UPDATE signals_1m SET updated_at=datetime('now') WHERE updated_at IS NULL OR updated_at='';")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_signals_symbol_ts_horizon_model ON signals_1m(symbol, ts, horizon, model);")
 
     # decisions (Decision Layer)
     _ensure_decisions_table(conn)
@@ -285,16 +316,32 @@ def _ensure_decisions_table(conn: sqlite3.Connection):
     add_col("reason", "reason TEXT")
     add_col("risk_pause_until", "risk_pause_until TEXT")
     add_col("status", "status TEXT NOT NULL DEFAULT 'OPEN'")
-    add_col("created_at", "created_at TEXT NOT NULL DEFAULT (datetime('now'))")
-    add_col("updated_at", "updated_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    # SQLite 限制：ALTER TABLE ... ADD COLUMN 不允许非恒定默认值（如 datetime('now')）。
+    # 因此补列时不设置动态默认，时间戳改为在 INSERT/UPDATE 时显式写入。
+    add_col("created_at", "created_at TEXT")
+    add_col("updated_at", "updated_at TEXT")
     add_col("future_close", "future_close REAL")
     add_col("pnl", "pnl REAL")
     add_col("hit_flag", "hit_flag INTEGER")
     add_col("closed_at", "closed_at TEXT")
 
+    # 兼容旧表（主键可能是 symbol+ts+model）：补一个唯一索引以支持 horizon 维度 UPSERT。
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_decisions_symbol_ts_horizon_model ON decisions_1m(symbol, ts, horizon, model);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions_1m(ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions_1m(model);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions_1m(status);")
+
+    # 兼容历史数据：为旧行补齐空时间字段，避免后续逻辑读取到空值。
+    cur.execute("""
+    UPDATE decisions_1m
+    SET created_at=datetime('now')
+    WHERE created_at IS NULL OR created_at='';
+    """)
+    cur.execute("""
+    UPDATE decisions_1m
+    SET updated_at=datetime('now')
+    WHERE updated_at IS NULL OR updated_at='';
+    """)
 
     conn.commit()
 
@@ -1110,9 +1157,31 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL)
     ap.add_argument("--use_demo", type=int, default=1, help="1=use demo datasource, 0=placeholder for real datasource")
+    ap.add_argument(
+        "--shell_hint",
+        type=int,
+        default=1,
+        help="1=打印 PowerShell/Python REPL 误用提示；0=关闭提示",
+    )
     return ap.parse_args()
+
+
+def print_shell_misuse_hint(enabled: bool = True):
+    if not enabled:
+        return
+
+    logging.info(
+        "[HINT] 请在 PowerShell/CMD 中运行: python scheduler_app.py --use_demo 1 --symbol 螺纹"
+    )
+    logging.info(
+        "[HINT] 不要在 PowerShell 里输入 Python 语句如 if __name__ == '__main__':"
+    )
+    logging.info(
+        "[HINT] 若看到 >>> 提示符，说明你在 Python REPL，请先执行 exit() 退出后再运行脚本命令"
+    )
 
 
 if __name__ == "__main__":
     args = parse_args()
+    print_shell_misuse_hint(enabled=bool(args.shell_hint))
     run_scheduler(symbol=args.symbol, use_demo=bool(args.use_demo))
